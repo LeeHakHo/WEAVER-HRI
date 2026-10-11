@@ -131,6 +131,15 @@ class StreamingRollout:
         # Store the incoming actions at head-1 .. head+bootstrap-2.
         for j in range(n_new):
             self.action_buffer[:, self._buf([self.head - 1 + j])[0]] = step_actions[:, j]
+        # The chunk the model sees runs to head+horizon-1, one slot past the
+        # last action above, and the model reads a frame's own slot when it
+        # generates that frame. Left at zero, that slot is not "no command":
+        # with normalised commanded-pose actions it orders the dataset-mean
+        # pose, and the last frame of every chunk jumped ~5 cm toward it.
+        # Repeat the last action instead -- "hold" -- until the next step()
+        # overwrites it. The batch rollout has the real next action there.
+        for p in range(self.head - 1 + n_new, self.head + self.horizon):
+            self.action_buffer[:, self._buf([p])[0]] = step_actions[:, -1]
 
         chunk_start = self.head - self.n_hist
         pos = list(range(chunk_start, self.head + self.horizon))

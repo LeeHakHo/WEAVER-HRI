@@ -315,24 +315,29 @@ refactor of it.
 
 ## Known limits
 
-- **The robot is pulled toward the dataset's mean pose.** Measured on the
-  step-45,000 checkpoint over all 8 validation seeds: with the command held at
-  the seed pose, the predicted robot origin jumps about 40% of the way toward
-  the training-set mean position within the first 8-frame chunk and then stays
-  there. Seed 9000 starts 13.5 cm to one side of the mean in y and moves
-  5.3 cm toward it; seed 9006 starts 14.9 cm to the other side and moves 6.0 cm
-  the opposite way; seed 9001 starts at the mean and moves 0.1 cm. The jump is
-  the same across sampling seeds, and it also appears when the recorded
-  commands are replayed, so it is neither sampling noise nor an artefact of a
-  held command. Over-commanding by 0.67 x (pose − mean) cancels most of it.
-  Put differently, the robot follows about 60% of a commanded offset from the
-  mean, which matches the 0.54-0.81 tracking ratio a held key gets. The cause
-  is not established, and these figures are for the predicted state, not for
-  pixels. It has not been measured for the hand.
+- **Fixed: the keyboard demo used to drag the robot toward the dataset's mean
+  pose.** `StreamingRollout.step()` left the action in the last slot of each
+  chunk at zero. The batch rollout that evaluation uses has the real next
+  action there, which is why replay looked fine and the keyboard did not. The
+  model reads a frame's own slot when it generates that frame, and a zero in
+  normalised commanded-pose space is an order to go to the mean pose, so the
+  8th frame of every chunk jumped 4-5 cm toward it and then became the next
+  chunk's history. The slot now repeats the last action. On the step-45,000
+  checkpoint, seed 9000, 96 frames:
+
+  | | before | after |
+  |---|---|---|
+  | robot travel with no key held | 6.5 cm | 0.4 cm |
+  | robot +x, fraction of command followed | 0.67 | 0.99 |
+  | robot +y, fraction of command followed | 0.81 | 0.97 |
+  | replayed commands, mean error of predicted origin (48 frames) | 1.6 cm | 0.4 cm |
+
+  These are the predicted state, not pixels. EMA versus raw weights made no
+  difference to any of it.
 - **The demos do not apply the rig's rest offset.** At rest the recorded robot
   command sits about 0.6 cm below the observed origin with the jaws about 1 cm
   wider. `tools/test_action_following.py` adds that offset; the two demos do
-  not. It made no measurable difference to the jump above.
+  not, and its effect has not been measured since the fix above.
 - **One hour of data, one task, one scene.** Long rollouts will drift; the
   demo is meant for the few-second horizon.
 - **Domain gap.** The pretrained model saw Franka arms in DROID scenes; the

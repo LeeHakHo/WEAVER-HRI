@@ -150,9 +150,10 @@ def test_action_chunk_covers_history_and_future():
     # ... then the new ones, which drive the frames that get kept ...
     assert torch.equal(chunk[n_hist - 1:n_hist - 1 + roll.bootstrap],
                        step_actions[0, :, 0])
-    # ... and the tail, which would drive frames beyond `bootstrap`, stays zero
-    # because those frames are discarded.
-    assert torch.all(chunk[n_hist - 1 + roll.bootstrap:] == 0.0)
+    # ... and the tail repeats the last action. It must not stay zero: the
+    # model reads a frame's own slot, and a zero there is a command to the
+    # dataset-mean pose once actions are normalised absolute poses.
+    assert torch.all(chunk[n_hist - 1 + roll.bootstrap:] == step_actions[0, -1, 0])
 
 
 def test_latest_states_tracks_the_head():
