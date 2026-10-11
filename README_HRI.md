@@ -32,16 +32,30 @@ idx  9..17    hand   origin(3)  contact_a(3)  contact_b(3)
 Everything is a position in the **robot base frame**, in metres —
 `meta/camera_calibration.json` states that frame is the one the episodes' own
 FK/EEF features live in, which is what lets the two agents be compared at all.
-`states[t]` holds the points; `actions[t] = states[t+1] - states[t]` at the 5 fps
-video rate.
+`states[t]` holds the observed points at the 5 fps video rate.
+
+`actions[t]` is the **commanded pose** of the same eighteen numbers, not a
+delta (`build_actions` in `tools/lerobot_to_weaver.py`):
+
+* **robot** — the recorded teleoperation command (`action_right_ee_*` and
+  `action_right_gripper`) run through the same three-point geometry as the
+  state. This is what a policy would emit, and the gap between commanded and
+  observed jaws is the grasp: the jaws are commanded shut while the object
+  holds them apart. The command leads the observed arm by a median of about
+  1.2 cm.
+* **hand** — there is no command to record, so it is defined as the hand's own
+  next observed pose, `states[t+1]`.
+
+An earlier version used `actions[t] = states[t+1] - states[t]` for both; its
+annotations and statistics are kept as `*.delta_backup*`.
 
 What this buys:
 
 * **the same number means the same thing for both.**  `‖contact_a − contact_b‖`
   is the opening, in centimetres, for the gripper and for the hand alike; the
   origin is where the agent is; the triangle is how it is posed.
-* **no angles**, so no Euler convention, no wrapping, and a plain subtraction
-  for the action.
+* **no angles**, so no Euler convention and no wrapping; the action lives in
+  the same coordinates as the state.
 * **no invented constants.**  The previous design normalised the hand's pinch
   onto [0, 1] with a hand-picked 3-14 cm range; there is nothing to pick here.
 * **every channel is a point you can see in the image**, which is what a video
@@ -119,16 +133,32 @@ data/weaver_hri/
   annotation_rewards/{train,val}/<id>.json    states, actions, text features
   videos/{train,val}/<id>.mp4                 192x960: cam_high|cam_low|cam_wrist
   latents/{train,val}/<id>_sd3.npz            (3, T, 60, 256) float16
-  norm_stats_relabel.json
+  norm_stats_cmd.json                         statistics for the commanded-pose actions
 ```
 
 Cameras map onto WEAVER's fixed slots as cam_high→`exterior_1_left`,
-cam_low→`exterior_2_left`, cam_right_wrist→`wrist_left`; training uses the same
-two views the released checkpoint was trained with.  Each ~3000-frame episode is
-cut into 200-frame segments — one trajectory per episode would give the sampler
-nothing to shuffle.
+cam_low→`exterior_2_left`, cam_right_wrist→`wrist_left`. All three are
+converted, but training uses the top-down view alone (see Phase 3).  Each
+~3000-frame episode is cut into 200-frame segments — one trajectory per episode
+would give the sampler nothing to shuffle.
 
-Episodes 1-6 → `train`, the eval episode → `val`.
+Episodes 1-6 → `train` (90 segments, ids 1000-6xxx), the eval episode → `val`
+(8 segments, ids 9000-9007).
+
+**Object tracks.** `tools/extract_object_tracks.py` (SAM 3 with a text prompt,
+depth sampled inside the mask) gives the cube and the bowl as one base-frame
+point each. `lerobot_to_weaver.py --objects <npz>` writes them into the
+annotation as `objects` / `object_valid`. They are a prediction target only and
+never enter the state or the action.
+
+Three things the driver scripts do not do yet, and were run by hand for the
+current dataset:
+
+* `run_phase2.sh` does not pass `--objects`;
+* `compute_norm_stats_hri.py` writes `norm_stats_relabel.json` by default, so
+  the file training reads needs `--out data/weaver_hri/norm_stats_cmd.json`;
+* `rest_offset.npy` (the mean commanded-minus-observed offset on frames where
+  the arm is still, read by `tools/test_action_following.py`) has no script.
 
 Reward is a constant: this is play data with no success labels, and the reward
 and critic heads are switched off for the finetune, so the RoboMeter labelling
@@ -140,13 +170,16 @@ The released checkpoint is 8-D (Franka joints + gripper) and ~915 M parameters
 in the world model alone; the target is 18-D on a 16 GB card.  `weaver/finetune_utils.py`
 handles both:
 
-- `load_state_dict_shape_filtered` loads the 661 tensors that fit and reports
-  the 9 that do not — the first layer of each state/action MLP and the state
-  read-out — leaving them at fresh init.
+- `load_state_dict_shape_filtered` loads every tensor whose shape still fits
+  and reports the ones that do not — the first layer of each state/action MLP
+  and the state read-out — leaving them at fresh init.
 - `apply_lora` / `freeze_for_lora` wrap the 128 linears in the transformer
-  blocks (rank 32) and train the projections densely: **33.7 M of 1.16 B
-  trainable (2.9%)**. Model, adapters, EMA and optimiser together occupy 4.8 GB
-  and a training step peaks at 7.5 GB of the card's 15.6 GB.
+  blocks (rank 32) and train the projections densely: about **33 M of 1.16 B
+  parameters trainable**. The re-initialised projections get 10x the adapter
+  learning rate (`PROJ_LR_MULT`).
+- Checkpoints save the trainable parameters only (~535 MB instead of ~5 GB);
+  `load_finetuned` recovers the frozen remainder from the pretrained
+  checkpoint.
 - The checkpoint is loaded onto the CPU: `checkpoint.pt` carries model + EMA +
   optimiser (~8 GB) and will not fit beside the built model on a 16 GB card.
 - The EMA is rebuilt, since it snapshots the trainable set at construction and
@@ -155,17 +188,46 @@ handles both:
 `n_states`/`n_actions` are deliberately excluded from the config keys inherited
 from the pretrained run — changing them is the point.
 
+Other choices in `scripts/finetune_local.sh`:
+
+- **Top-down view only** (`IMG_KEYS=['exterior_1_left']`). The wrist camera
+  rarely shows the person's hand, so half the image tokens had nothing for the
+  hand action to explain.
+- **Object head** (`N_OBJECTS=2`, loss scale 0.1). A linear read-out predicts
+  the cube and bowl positions, masked by detector validity. Without it the cube
+  faded out of long rollouts.
+- Batch 2 with 4-step gradient accumulation, learning rate 3e-5, reward and
+  critic losses off.
+
+**What a training sample is.** Not a single transition: a window of 2 history
+frames plus 8 future frames (1.6 s), with 6 sparse memory frames spaced 5
+frames apart before it. The 8 future frames' image latents and states are
+denoised jointly with a flow-matching loss, each frame at its own noise level
+(`diff_forcing`). The state is therefore a generated output, not something
+integrated from the action.
+
+**Status.** The run is at step 45,000 of a configured 50,000 (`resume: true`).
+
 ### Phase 4 — evaluation (`scripts/eval_local.sh`)
 
 FID / FVD / LPIPS on the held-out episode, plus the test those metrics cannot
 do: `tools/counterfactual_rollout.py` replays the same clip from the same seed
 four times, varying only which half of the action vector is live
-(`full` / `robot` / `hand` / `frozen`), and tiles the results.  "Hold still" is
-a zero delta in metres, so with this representation it is literally zero motion.
+(`full` / `robot` / `hand` / `frozen`), and tiles the results.  The action is a
+commanded pose, so "hold still" means commanding the pose the agent currently
+occupies; a zero action would send it to the base-frame origin.
 A model that ignored the hand channels would still score well on FVD; it would
 visibly fail here.
 
-### Phase 5 — keyboard demo (`weaver/interactive.py`)
+Two further checks replay or synthesise commands and compare the model's
+predicted state with them:
+
+- `tools/state_vs_action.py` — predicted vs commanded vs recorded trajectories
+  under the recorded actions.
+- `tools/test_action_following.py` — a key held in each direction from the same
+  seed, reporting travel along and across the commanded direction.
+
+### Phase 5 — keyboard demo (`weaver/interactive.py`, `weaver/interactive_web.py`)
 
 Seeds from a few real validation frames, then imagines everything.
 `weaver/wm/streaming.py` turns WEAVER's chunked memory rollout — which normally
@@ -183,9 +245,20 @@ controls — move it, open it, turn it:
  Tab focus   C camera   Backspace re-seed   V record   Esc quit
 ```
 
-The target points are computed from the model's *own* latest predicted state,
-so what "open" and "turn" mean stays consistent with whatever the world model
-currently believes rather than drifting from an integrated command.
+The demo owns the commanded pose: `target` starts at the seed's last state and
+only the keys move it. (An earlier version re-read the model's predicted state
+every chunk, which made "no key" mean "go to wherever you just ended up".) A
+held key ramps the target by 0.3 cm per frame — 14.4 cm over 48 frames, just
+above the training median for that window.
+
+`weaver/interactive_web.py` is the same demo served to a browser as an MJPEG
+stream, for use over a remote connection:
+
+```bash
+.venv/bin/python -m weaver.interactive_web \
+    --checkpoint runs/weaver_hri/logs/chkpts_hri \
+    --overrides dataset.path=data/weaver_hri      # then open http://<host>:8420
+```
 
 ---
 
@@ -225,11 +298,14 @@ Needs ~35 GB of free disk and a CUDA GPU with 16 GB.
 |---|---|
 | `weaver/datasets/droid.py` | use `states`/`actions` from the annotation when present; reward handling split into `_preprocess_rewards` |
 | `weaver/finetune.py` | shape-filtered checkpoint load, LoRA flags, EMA rebuild, `n_states`/`n_actions` no longer inherited |
-| `weaver/generate_views.py` | rebuild LoRA wrappers before loading a LoRA checkpoint |
+| `weaver/generate_views.py` | load through `load_finetuned`, which rebuilds the LoRA wrappers |
+| `weaver/wm/model.py` | auxiliary object-position head and its masked loss |
+| `weaver/utils/tools.py` | trainable-only checkpoints; EMA moved back to the model's device on resume |
 | `weaver/finetune_utils.py` | *new* — filtered loading, LoRA, EMA rebuild |
 | `weaver/wm/streaming.py` | *new* — `StreamingRollout` |
-| `weaver/interactive.py` | *new* — keyboard demo |
-| `tools/`, `scripts/*_local.sh` | *new* — the data pipeline and single-GPU launchers |
+| `weaver/interactive.py`, `weaver/interactive_web.py` | *new* — keyboard demo, pygame and browser |
+| `tests/test_streaming.py` | *new* — index bookkeeping of `StreamingRollout` against a stub model |
+| `tools/`, `scripts/*_local.sh` | *new* — the data pipeline, diagnostics and single-GPU launchers |
 
 Everything else, including `generate_videos_full_memory`, is untouched: it is
 what evaluation runs on, and the streaming path is additive rather than a
@@ -239,6 +315,24 @@ refactor of it.
 
 ## Known limits
 
+- **The robot is pulled toward the dataset's mean pose.** Measured on the
+  step-45,000 checkpoint over all 8 validation seeds: with the command held at
+  the seed pose, the predicted robot origin jumps about 40% of the way toward
+  the training-set mean position within the first 8-frame chunk and then stays
+  there. Seed 9000 starts 13.5 cm to one side of the mean in y and moves
+  5.3 cm toward it; seed 9006 starts 14.9 cm to the other side and moves 6.0 cm
+  the opposite way; seed 9001 starts at the mean and moves 0.1 cm. The jump is
+  the same across sampling seeds, and it also appears when the recorded
+  commands are replayed, so it is neither sampling noise nor an artefact of a
+  held command. Over-commanding by 0.67 x (pose − mean) cancels most of it.
+  Put differently, the robot follows about 60% of a commanded offset from the
+  mean, which matches the 0.54-0.81 tracking ratio a held key gets. The cause
+  is not established, and these figures are for the predicted state, not for
+  pixels. It has not been measured for the hand.
+- **The demos do not apply the rig's rest offset.** At rest the recorded robot
+  command sits about 0.6 cm below the observed origin with the jaws about 1 cm
+  wider. `tools/test_action_following.py` adds that offset; the two demos do
+  not. It made no measurable difference to the jump above.
 - **One hour of data, one task, one scene.** Long rollouts will drift; the
   demo is meant for the few-second horizon.
 - **Domain gap.** The pretrained model saw Franka arms in DROID scenes; the
