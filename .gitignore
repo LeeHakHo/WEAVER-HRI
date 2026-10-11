@@ -25,3 +25,10 @@ datasets/preprocessed_test/*
 droid*
 CLAUDE.md
 demos/**
+
+# Local HRI finetune artefacts
+/data/
+/checkpoints/
+/runs/
+.venv*/
+*.bak

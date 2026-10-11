@@ -301,6 +301,8 @@ class PrecomputedDroid(Dataset):
         self.valid_trajectories: List[int] = []
 
         self._states: List[torch.Tensor] = []
+        self._objects: List[Optional[torch.Tensor]] = []
+        self._object_valid: List[Optional[torch.Tensor]] = []
         self._actions: List[torch.Tensor] = []
         self._text_features: List[torch.Tensor] = []
         self._rewards: List[torch.Tensor] = []
@@ -324,6 +326,17 @@ class PrecomputedDroid(Dataset):
                 self._states.append(states)
                 self._actions.append(actions)
                 self._rewards.append(rewards)
+                ann = traj.annotation
+                if 'objects' in ann:
+                    o = torch.tensor(ann['objects'], dtype=torch.float32)
+                    v = torch.tensor(ann.get('object_valid',
+                                             [[1] * (o.shape[-1] // 3)] * len(o)),
+                                     dtype=torch.float32)
+                    self._objects.append(o)
+                    self._object_valid.append(v)
+                else:
+                    self._objects.append(None)
+                    self._object_valid.append(None)
 
                 if self.return_language:
                     self._texts.append(traj.annotation['texts'][0])
@@ -339,6 +352,33 @@ class PrecomputedDroid(Dataset):
 
     def __len__(self) -> int:
         return len(self.valid_trajectories)
+
+    def _preprocess_rewards(
+        self,
+        annotation: Dict,
+        raw_length: int,
+        n_states: int,
+        state_indices: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Read annotation[reward_key] and bring it to the video frame rate."""
+        if self.reward_key not in annotation:
+            raise ValueError(
+                f"Reward key '{self.reward_key}' not found in annotation for "
+                f"episode {annotation.get('episode_id', '<unknown>')}. "
+                f"Available keys: {list(annotation.keys())}"
+            )
+        rewards = np.asarray(annotation[self.reward_key], dtype=np.float32).reshape(-1)
+        if self.negative_reward:
+            rewards = rewards - 1.0
+        if len(rewards) == n_states:
+            return rewards
+        if state_indices is not None and len(rewards) == raw_length:
+            return rewards[state_indices]
+        raise ValueError(
+            f"Reward key '{self.reward_key}' has length {len(rewards)}, but expected "
+            f"raw length {raw_length} or downsampled length {n_states} for "
+            f"episode {annotation.get('episode_id', '<unknown>')}."
+        )
 
     def _preprocess_states_actions(
         self,
@@ -356,6 +396,19 @@ class PrecomputedDroid(Dataset):
             states: (T, 8) float32 tensor of states at video frame rate
             actions: (T, 8) float32 tensor of actions at video frame rate
         """
+        # Datasets whose state/action space is not DROID's joint space (e.g. the
+        # unified robot-EEF + human-hand track produced by tools/lerobot_to_weaver.py)
+        # store the already-assembled video-rate tracks on the annotation.
+        if 'states' in annotation and 'actions' in annotation:
+            states = np.asarray(annotation['states'], dtype=np.float32)
+            actions = np.asarray(annotation['actions'], dtype=np.float32)
+            rewards = self._preprocess_rewards(annotation, len(states), len(states))
+            return (
+                torch.from_numpy(states).float(),
+                torch.from_numpy(actions).float(),
+                torch.from_numpy(rewards).float(),
+            )
+
         joint_position = np.array(annotation['observation.state.joint_position'])
         gripper_position = np.array(annotation['observation.state.gripper_position'])[:, None]
         if len(gripper_position.shape) == 3:
@@ -365,23 +418,7 @@ class PrecomputedDroid(Dataset):
         raw_length = len(joint_position)
         state_indices = np.arange(0, raw_length, RGB_SKIP)
         states = full_states[state_indices]
-        if self.reward_key not in annotation:
-            raise ValueError(
-                f"Reward key '{self.reward_key}' not found in annotation for "
-                f"episode {annotation.get('episode_id', '<unknown>')}. "
-                f"Available keys: {list(annotation.keys())}"
-            )
-        rewards = np.asarray(annotation[self.reward_key], dtype=np.float32).reshape(-1)
-        if self.negative_reward:
-            rewards = rewards - 1.0
-        if len(rewards) == raw_length:
-            rewards = rewards[state_indices]
-        elif len(rewards) != len(states):
-            raise ValueError(
-                f"Reward key '{self.reward_key}' has length {len(rewards)}, but expected "
-                f"raw length {raw_length} or downsampled length {len(states)} for "
-                f"episode {annotation.get('episode_id', '<unknown>')}."
-            )
+        rewards = self._preprocess_rewards(annotation, raw_length, len(states), state_indices)
 
         if self.relabel_actions:
             next_state_indices = np.clip(state_indices + RGB_SKIP, 0, len(full_states) - 1)
@@ -506,6 +543,13 @@ class PrecomputedDroid(Dataset):
             'actions': actions,
             'rewards': rewards,
         }
+
+        # Object positions are a prediction target only -- never put in obs, so
+        # the model cannot read them back and has to recover them from the
+        # image. Validity comes straight from the detector.
+        if self._objects and self._objects[traj_idx] is not None:
+            result['objects'] = self._objects[traj_idx][start_idx:end_idx].clone()
+            result['object_valid'] = self._object_valid[traj_idx][start_idx:end_idx].clone()
 
         # Build sparse memory frames before history, spaced by t_memory from t.
         # Memory collapse is coupled to the same `collapse` dice as history collapse:

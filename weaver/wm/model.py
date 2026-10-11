@@ -242,6 +242,7 @@ class FlowWM(nn.Module):
         n_im_feature: int = 384,
         n_states: int = 7,
         n_actions: int = 7,
+        n_objects: int = 0,
         qk_norm: bool = False,
         use_linear_proj: bool = False,
         # Spatial configuration - determines patch grid automatically
@@ -361,6 +362,15 @@ class FlowWM(nn.Module):
         })
         self.out_prj['states'] = nn.Linear(n_embed, n_states, bias=False)
 
+        # Object positions are predicted but never fed back in. Putting them in
+        # the state vector instead would let the model copy the previous value
+        # forward and score well without ever grounding it in the image, which
+        # is the opposite of the point: this loss exists to force the latent to
+        # encode where the objects are. Deliberately outside out_prj, whose
+        # keys are the flow-matching targets.
+        self.out_prj_objects = (nn.Linear(n_embed, n_objects * 3, bias=False)
+                                if n_objects else None)
+
         # Apply weight initialization
         self.apply(self._init_weights)
 
@@ -439,6 +449,7 @@ class FlowWM(nn.Module):
         self,
         x: torch.Tensor,
         P: int,  # Patches per image
+        return_aux: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Decode WM output back to feature space.
@@ -465,6 +476,10 @@ class FlowWM(nn.Module):
         # Token order: [patches..., state, action, time]
         # state is at index -3 (third from end)
         output['states'] = self.out_prj['states'](x[:, :, -3, :])
+        if return_aux:
+            aux = ({'objects': self.out_prj_objects(x[:, :, -3, :])}
+                   if self.out_prj_objects is not None else {})
+            return output, aux
         return output
 
     # ==================== SPRINT Helper Methods ====================
@@ -742,6 +757,7 @@ class FlowWM(nn.Module):
         t: torch.Tensor,
         cond: Optional[torch.Tensor] = None,
         memory: Optional[torch.Tensor] = None,
+        return_aux: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass of FlowWM.
@@ -874,7 +890,7 @@ class FlowWM(nn.Module):
 
         x = rearrange(x, 'b (t n) d -> b t n d', t=T)
 
-        return self.decode(x, P=P)
+        return self.decode(x, P=P, return_aux=return_aux)
 
 class WEAVER(nn.Module):
     def __init__(
@@ -920,6 +936,9 @@ class WEAVER(nn.Module):
         self._use_temporal_loss = _cfg_get(config, 'use_temporal_loss', False)
         self._temporal_loss_coeff = _cfg_get(config, 'temporal_loss_coeff', 0.1)
         self._state_loss_scale = _nested_cfg_get(_cfg_get(config, 'loss_scale', None), 'states', 0.1)
+        self._n_objects = int(_cfg_get(config, 'n_objects', 0))
+        self._object_loss_scale = _nested_cfg_get(
+            _cfg_get(config, 'loss_scale', None), 'objects', 0.1)
         self._rm_loss_coeff = _cfg_get(config, 'rm_loss_coeff', 1.0)
         self._critic_loss_coeff = _cfg_get(config, 'critic_loss_coeff', 1.0)
 
@@ -969,6 +988,7 @@ class WEAVER(nn.Module):
             n_im_feature=self.im_encoder.feature_dim,
             n_states=n_states,
             n_actions=n_actions,
+            n_objects=self._n_objects,
             qk_norm=config.qk_norm,
             use_linear_proj=config.use_linear_proj,
             # Spatial configuration (from encoder)
@@ -2013,6 +2033,8 @@ class WEAVER(nn.Module):
         # Flow matching loss
         flow_loss = sum(losses[f'flow/{k}'] for k in self._img_keys)
         flow_loss = flow_loss + self._state_loss_scale * losses['flow/states']
+        if 'aux/objects' in losses:
+            flow_loss = flow_loss + self._object_loss_scale * losses['aux/objects']
 
         total_loss = flow_loss.clone()
 
@@ -2058,6 +2080,8 @@ class WEAVER(nn.Module):
         gt_rewards: Optional[torch.Tensor] = None,
         memory: Optional[Dict[str, torch.Tensor]] = None,
         update_rm: bool = True,
+        objects: Optional[torch.Tensor] = None,
+        object_valid: Optional[torch.Tensor] = None,
     ) -> tuple:
 
         losses = {}
@@ -2113,10 +2137,23 @@ class WEAVER(nn.Module):
                 noised_hist = hist + torch.randn_like(hist) * self._history_noise_std
                 xt[k] = torch.cat([noised_hist, future], dim=1)
 
-        x_pred = self.wm(
+        x_pred, aux = self.wm(
             xt, actions, t,
             memory=memory_tokens,
+            return_aux=True,
         )
+
+        # Auxiliary object regression. Masked, because the detector loses the
+        # cube or the bowl in a few percent of frames and a fabricated target
+        # there would teach the model to put the object in the wrong place.
+        if 'objects' in aux and objects is not None:
+            pred = aux['objects'][:, self._n_history:]
+            tgt = objects[:, self._n_history:]
+            m = (object_valid[:, self._n_history:].to(pred.dtype)
+                 if object_valid is not None else torch.ones_like(tgt[..., :1]))
+            m = m.repeat_interleave(3, dim=-1)          # one flag per object -> xyz
+            denom = m.sum().clamp(min=1.0)
+            losses['aux/objects'] = (((pred - tgt) ** 2) * m).sum() / denom
 
         # Add Flow Matching loss function
         for key in x_pred:

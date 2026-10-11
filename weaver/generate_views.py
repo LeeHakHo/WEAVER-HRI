@@ -19,8 +19,8 @@ import torch
 import yaml
 
 from .datasets.droid import PrecomputedDroid
+from .finetune_utils import load_finetuned
 from .utils.config import dict_to_namespace, load_config, merge_dicts, update_config
-from .utils.tools import load_checkpoint
 from .wm.encoders import get_encoder, get_task_encoder
 from .wm.model import WEAVER
 
@@ -79,6 +79,9 @@ def build_model(cfg, device: str):
         inference_config=cfg.inference,
     ).to(device)
     model.ema.to(device)
+    # LoRA wrapping and weight loading happen together in
+    # finetune_utils.load_finetuned, because the frozen weights must land before
+    # the adapters rename the linears they wrap.
     return model, img_keys
 
 
@@ -345,13 +348,7 @@ def main():
     print(f"Device: {device}")
 
     model, img_keys = build_model(cfg, device)
-    ckpt = load_checkpoint(checkpoint_dir, device, weights_only=True)
-    missing, unexpected = model.load_state_dict(clean_state_dict(ckpt["model"]), strict=False)
-    print(f"Loaded model with {len(missing)} missing and {len(unexpected)} unexpected keys")
-    if missing:
-        print("Missing keys:", missing[:20])
-    if unexpected:
-        print("Unexpected keys:", unexpected[:20])
+    ckpt = load_finetuned(model, checkpoint_dir, cfg, device=device)
 
     if args.use_ema:
         print("Using EMA weights")

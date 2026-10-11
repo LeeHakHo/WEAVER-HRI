@@ -64,6 +64,13 @@ class EMA:
 
     def load_state_dict(self, state):
         self.ema.load_state_dict(state)
+        # EMAModel.load_state_dict swaps in the checkpoint's tensors verbatim,
+        # and checkpoint.pt is loaded onto the CPU because model + EMA +
+        # optimiser do not fit beside the built model on a 16 GB card. Put the
+        # shadow weights back where the tracked parameters live, or the first
+        # step() after a resume mixes cuda and cpu tensors.
+        if self.params:
+            self.to(self.params[0].device)
 
     # ---------------- Context manager ----------------
     class _EMAContext:
@@ -129,14 +136,27 @@ def save_checkpoint(
     suffix: str = '',
     save_config: bool = True,
     atomic: bool = True,
+    trainable_only: bool = False,
 ):
-    """Save checkpoint to a single checkpoint.pt file (atomic overwrite)."""
+    """Save checkpoint to a single checkpoint.pt file (atomic overwrite).
+
+    With ``trainable_only`` the model entry keeps just the parameters that carry
+    gradients. Under LoRA that is ~34 M of 1.16 B — a few hundred megabytes
+    instead of 5 GB per save — and the frozen remainder (the pretrained world
+    model, the SD3 VAE, CLIP) is recovered from the pretrained checkpoint at load
+    time. The saved state is tagged so loaders know which kind they are holding.
+    """
     print (f'Saving model at step: {step} at {chkpt_dir}')
+    model_state = model.state_dict()
+    if trainable_only:
+        keep = {n for n, p in model.named_parameters() if p.requires_grad}
+        model_state = {k: v for k, v in model_state.items() if k in keep}
     state = {
-        'model': model.state_dict(),
+        'model': model_state,
         'optimizer': optimizer.state_dict(),
         "ema": model.ema.state_dict(),
         "step": step,
+        "trainable_only": trainable_only,
     }
     ckpt_path = os.path.join(chkpt_dir, f'checkpoint{suffix}.pt')
     if atomic:

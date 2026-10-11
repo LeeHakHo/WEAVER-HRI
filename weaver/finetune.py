@@ -25,6 +25,10 @@ from einops import rearrange
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from .finetune_utils import (
+    apply_lora, configure_optimizers_split, freeze_for_lora,
+    load_state_dict_shape_filtered, rebuild_ema,
+)
 from .utils.config import dict_to_namespace, merge_dicts, parse_config, update_config
 from .wm.encoders import get_encoder, get_task_encoder
 from .wm.model import WEAVER
@@ -74,7 +78,11 @@ def inherit_pretrained_config(cfg_dict: dict, pretrained_cfg: dict | None) -> di
 
     pretrained_dataset = pretrained_cfg.get("dataset", {})
     cfg_dict.setdefault("dataset", {})
-    for key in ["img_keys", "image_size", "n_states", "n_actions"]:
+    # img_keys / image_size must match the pretrained tokenisation. n_states and
+    # n_actions must NOT be inherited: finetuning onto a different action space
+    # (e.g. robot EEF + human hand) is the whole point of changing them, and the
+    # affected projections are handled by load_state_dict_shape_filtered.
+    for key in ["img_keys", "image_size"]:
         if key in pretrained_dataset:
             cfg_dict["dataset"][key] = pretrained_dataset[key]
 
@@ -194,11 +202,18 @@ def enable_activation_checkpointing(model, master_process: bool):
     print(f"Activation checkpointing enabled on {n_ckpt} STAttentionBlock layers")
 
 
-def save_validation_videos(raw_model, valid_video_iter, cfg, img_keys, vid_dir, step: int):
+def save_validation_videos(raw_model, valid_video_iter, cfg, img_keys, vid_dir, step,
+                           n_batches: int = 1, use_wandb: bool = False):
+    """Write a few GT-vs-prediction clips.
+
+    Each clip is an autoregressive rollout over ``eval_video_frames`` and costs
+    about a minute, so the batch count is kept low: this is a sanity glance
+    between checkpoints, not the evaluation (that is scripts/eval_local.sh).
+    """
     raw_model.eval()
     n_vids = 4
     sample_idx = 0
-    for _ in range(4):
+    for _ in range(n_batches):
         val_data = next(valid_video_iter)
         val_data = move_tensors_to_device(val_data, device="cuda")
         val_memory = {k: v[:n_vids] for k, v in val_data["memory"].items()} if "memory" in val_data else None
@@ -224,7 +239,16 @@ def save_validation_videos(raw_model, valid_video_iter, cfg, img_keys, vid_dir, 
                 for key in img_keys
             ]
             video = np.concatenate([np.concatenate(gt_views, axis=2), np.concatenate(pred_views, axis=2)], axis=1)
-            imageio.mimwrite(os.path.join(vid_dir, f"wm_valid_inference_step{step}_sample{sample_idx}.mp4"), (video * 255).astype(np.uint8), fps=5)
+            frames = (video * 255).astype(np.uint8)
+            path = os.path.join(vid_dir, f"wm_valid_inference_step{step}_sample{sample_idx}.mp4")
+            imageio.mimwrite(path, frames, fps=5)
+            if use_wandb:
+                import wandb
+                # Hand wandb the file just written, not the raw array: passing an
+                # array makes it re-encode through moviepy, an extra dependency
+                # for a video that already exists on disk.
+                wandb.log({f"valid/rollout_{sample_idx}": wandb.Video(path, format="mp4")},
+                          step=step)
             sample_idx += 1
 
         del val_data, val_memory, decoded_obs_pred
@@ -237,13 +261,39 @@ def main():
     parser.add_argument("--mode", type=str, default="defaults", choices=["defaults", "debug"])
     parser.add_argument("--pretrained_dir", type=str, required=True)
     parser.add_argument("--finetune_suffix", type=str, default="finetune")
+    parser.add_argument("--lora_rank", type=int, default=0,
+                        help="LoRA rank for the transformer blocks; 0 = full finetune. "
+                             "Needed to fit a ~915M-parameter finetune on a single 16GB GPU.")
+    parser.add_argument("--lora_alpha", type=float, default=None,
+                        help="LoRA alpha (default: 2 * rank)")
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument("--projection_lr_mult", type=float, default=1.0,
+                        help="learning-rate multiplier for the state/action "
+                             "projections. They are re-initialised whenever the "
+                             "action space changes, so they start much further "
+                             "from their target than the LoRA adapters and a "
+                             "shared rate lets the model settle into ignoring "
+                             "the action channels it can guess from the images.")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
+    if args.lora_alpha is None:
+        args.lora_alpha = 2.0 * args.lora_rank
 
     cfg, cfg_dict = parse_config(args)
     cfg_dict = inherit_pretrained_config(cfg_dict, load_pretrained_config(args.pretrained_dir))
     cfg_dict = apply_finetune_config(cfg_dict)
     cfg_dict = update_config(cfg_dict, dict(item.split("=", 1) for item in args.overrides))
+    # Recorded in the saved config so inference (generate_views, the interactive
+    # demo) can rebuild the same architecture before loading the weights.
+    cfg_dict["lora"] = {
+        "rank": args.lora_rank,
+        "alpha": args.lora_alpha,
+        "dropout": args.lora_dropout,
+        "projection_lr_mult": args.projection_lr_mult,
+    }
+    # A LoRA finetune stores only its trainable tensors, so anything loading it
+    # later needs to know where the frozen remainder came from.
+    cfg_dict["pretrained_dir"] = os.path.abspath(args.pretrained_dir)
     cfg = dict_to_namespace(cfg_dict)
 
     print("Arguments:", cfg)
@@ -264,10 +314,47 @@ def main():
     if not os.path.exists(os.path.join(load_dir, "checkpoint.pt")):
         raise FileNotFoundError(f"No checkpoint.pt found in {load_dir}")
 
-    ckpt = load_checkpoint(load_dir, "cuda")
-    model.load_state_dict(ckpt["model"])
-    model.ema.load_state_dict(ckpt["ema"])
-    if not resume_finetune:
+    # Onto the CPU, not the GPU: checkpoint.pt carries model + EMA + optimiser
+    # (~8 GB), which does not fit beside the built model on a 16 GB card.
+    # load_state_dict copies to the parameters' device anyway.
+    ckpt = load_checkpoint(load_dir, "cpu")
+
+    # A finetune checkpoint already contains the LoRA adapters, so the wrappers
+    # must exist before loading it. A pretrained checkpoint does not, so there
+    # the adapters go on afterwards — wrapping renames `...qkv_proj.weight` to
+    # `...qkv_proj.base.weight`.
+    use_lora = args.lora_rank > 0
+    if use_lora and resume_finetune:
+        # The finetune checkpoint holds only the trainable tensors; the frozen
+        # ones come from the pretrained run, and must land before LoRA wraps the
+        # linears and renames them.
+        if ckpt.get("trainable_only", False):
+            base = load_checkpoint(args.pretrained_dir, "cpu")
+            load_state_dict_shape_filtered(model, base["model"], verbose=master_process)
+            del base
+        apply_lora(model, args.lora_rank, args.lora_alpha, args.lora_dropout,
+                   verbose=master_process)
+
+    summary = load_state_dict_shape_filtered(model, ckpt["model"], verbose=master_process)
+
+    if use_lora and not resume_finetune:
+        apply_lora(model, args.lora_rank, args.lora_alpha, args.lora_dropout,
+                   verbose=master_process)
+    if use_lora:
+        freeze_for_lora(model, verbose=master_process)
+
+    # The EMA snapshots the trainable parameter set when the model is built, so
+    # it must be rebuilt whenever that set changed — freezing for LoRA, or a
+    # resized projection whose stored shadow weights no longer fit. When neither
+    # happened, the pretrained EMA still matches and is carried over.
+    if resume_finetune:
+        rebuild_ema(model)
+        model.ema.load_state_dict(ckpt["ema"])
+    else:
+        if use_lora or summary["mismatched"]:
+            rebuild_ema(model)
+        else:
+            model.ema.load_state_dict(ckpt["ema"])
         model.ema.ema.optimization_step = 0
 
     if cfg.use_compile:
@@ -283,12 +370,17 @@ def main():
         model = DDP(model, device_ids=[local_rank])
     raw_model = model.module if ddp else model
 
-    optimizer = raw_model.configure_optimizers(
-        weight_decay=cfg.training.weight_decay,
-        learning_rate=cfg.training.max_lr,
-        betas=tuple(cfg.training.betas),
-        device_type="cuda",
-    )
+    if use_lora:
+        optimizer = configure_optimizers_split(
+            raw_model, cfg.training.weight_decay, cfg.training.max_lr,
+            tuple(cfg.training.betas), args.projection_lr_mult, verbose=master_process)
+    else:
+        optimizer = raw_model.configure_optimizers(
+            weight_decay=cfg.training.weight_decay,
+            learning_rate=cfg.training.max_lr,
+            betas=tuple(cfg.training.betas),
+            device_type="cuda",
+        )
     if resume_finetune:
         optimizer.load_state_dict(ckpt["optimizer"])
         step = ckpt["step"]
@@ -297,9 +389,12 @@ def main():
         step = 0
         print(f"Starting finetune from pretrained checkpoint at {args.pretrained_dir}")
 
+    del ckpt                      # several GB of host memory, no longer needed
+    torch.cuda.empty_cache()
+
     def save_on_preempt(signum, frame):
         if master_process:
-            save_checkpoint(chkpt_save_dir, model=getattr(raw_model, "_orig_mod", raw_model) if cfg.use_compile else raw_model, optimizer=optimizer, cfg=cfg, step=step)
+            save_checkpoint(chkpt_save_dir, model=getattr(raw_model, "_orig_mod", raw_model) if cfg.use_compile else raw_model, optimizer=optimizer, cfg=cfg, step=step, trainable_only=use_lora)
         if ddp:
             dist.barrier()
         sys.exit(0)
@@ -311,7 +406,13 @@ def main():
         print(f"Number of trainable parameters in WEAVER: {num_params}")
         if cfg.use_wandb:
             import wandb
-            wandb.init(project=cfg.wandb.project, entity=cfg.wandb.entity, sync_tensorboard=False, config=cfg_dict, name=f"{cfg.dataset.name}_{cfg.exp_name}_finetune", group=f"{cfg.dataset.name}/{cfg.exp_name}")
+            entity = getattr(cfg.wandb, "entity", None)
+            if entity in ("", "null", "none", "None"):
+                entity = None      # fall back to the logged-in account's default
+            wandb.init(project=cfg.wandb.project, entity=entity, sync_tensorboard=False,
+                       config=cfg_dict, name=f"{cfg.exp_name}",
+                       group=f"{cfg.dataset.name}/{cfg.exp_name}")
+            wandb.summary["trainable_params"] = num_params
 
     train_iter = iter(cycle(train_loader))
     valid_video_iter = iter(cycle(valid_video_loader))
@@ -334,6 +435,8 @@ def main():
                     tasks=data["task"],
                     gt_rewards=data["rewards"],
                     memory=data.get("memory", None),
+                    objects=data.get("objects", None),
+                    object_valid=data.get("object_valid", None),
                 )
             total_loss = total_loss / cfg.training.gradient_accumulation_steps
             loss_accum += total_loss.detach()
@@ -347,7 +450,7 @@ def main():
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(step, cfg.training.warmup_steps, cfg.training.max_steps, cfg.training.max_lr, cfg.training.min_lr)
         for group in optimizer.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * group.get("lr_scale", 1.0)
         optimizer.step()
         raw_model.ema.update()
 
@@ -355,6 +458,9 @@ def main():
             mem_after = torch.cuda.memory_allocated() / 1024**3
             mem_peak = torch.cuda.max_memory_allocated() / 1024**3
             mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            # Only present when the auxiliary object head is enabled.
+            obj_str = (f" | Obj: {loss_log['aux/objects'].item():.6f}"
+                       if 'aux/objects' in loss_log else "")
             print(
                 f"Step: {step} | Time: {time.time() - t0:.3f}s"
                 f" | Total: {loss_accum.item():.6f}"
@@ -362,6 +468,7 @@ def main():
                 f" | RM: {loss_log['RM loss'].item():.6f}"
                 f" | V: {loss_log['Critic Loss'].item():.6f}"
                 f" | Dec: {loss_log['decoder/Total Loss'].item():.6f}"
+                f"{obj_str}"
                 f" | LR: {lr:.6f} | Norm: {norm:.6f}"
                 f" | Mem(GB) alloc: {mem_after:.2f} peak: {mem_peak:.2f} reserved: {mem_reserved:.2f} before: {mem_before:.2f}"
             )
@@ -395,19 +502,20 @@ def main():
             model.train()
 
         if cfg.save_model and step % cfg.ckpt_freq == 0 and master_process:
-            save_checkpoint(chkpt_save_dir, model=getattr(raw_model, "_orig_mod", raw_model) if cfg.use_compile else raw_model, optimizer=optimizer, cfg=cfg, step=step)
+            save_checkpoint(chkpt_save_dir, model=getattr(raw_model, "_orig_mod", raw_model) if cfg.use_compile else raw_model, optimizer=optimizer, cfg=cfg, step=step, trainable_only=use_lora)
             if step % 5000 == 0:
-                save_checkpoint(chkpt_save_dir, model=getattr(raw_model, "_orig_mod", raw_model) if cfg.use_compile else raw_model, optimizer=optimizer, cfg=cfg, step=step, suffix=str(step))
+                save_checkpoint(chkpt_save_dir, model=getattr(raw_model, "_orig_mod", raw_model) if cfg.use_compile else raw_model, optimizer=optimizer, cfg=cfg, step=step, suffix=str(step), trainable_only=use_lora)
 
         if cfg.video_log_freq > 0 and step % cfg.video_log_freq == 0 and master_process:
-            save_validation_videos(raw_model, valid_video_iter, cfg, img_keys, vid_dir, step)
+            save_validation_videos(raw_model, valid_video_iter, cfg, img_keys, vid_dir, step,
+                                   use_wandb=cfg.use_wandb)
 
         if ddp:
             dist.barrier()
         step += 1
 
     if cfg.save_model and master_process:
-        save_checkpoint(chkpt_save_dir, model=getattr(raw_model, "_orig_mod", raw_model) if cfg.use_compile else raw_model, optimizer=optimizer, cfg=cfg, step=step)
+        save_checkpoint(chkpt_save_dir, model=getattr(raw_model, "_orig_mod", raw_model) if cfg.use_compile else raw_model, optimizer=optimizer, cfg=cfg, step=step, trainable_only=use_lora)
     if ddp:
         destroy_process_group()
     print("Finetuning completed successfully.")
